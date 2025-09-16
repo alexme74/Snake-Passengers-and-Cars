@@ -1,0 +1,278 @@
+<html>
+<head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Змейка — iOS26 fix</title>
+<style>
+  body{margin:0;background:#222;display:flex;justify-content:center;align-items:center;height:100vh;font-family:monospace;color:#fff;user-select:none;-webkit-user-select:none;}
+  #intro{max-width:420px;background:#111;padding:18px;border-radius:10px;text-align:center;box-shadow:0 0 20px #0008;}
+  button{cursor:pointer;border:0;border-radius:6px;padding:10px 16px;font-size:15px}
+  #startBtn{background:#08f;color:#fff;margin-right:8px}
+  #motionBtn{background:#0a8;color:#fff;display:none}
+  #gameContainer{display:none;flex-direction:column;align-items:center;width:100%;max-width:420px}
+  #scoreboard{width:100%;text-align:center;padding:6px 0;background:#000a;border-radius:6px 6px 0 0;margin-bottom:-4px}
+  canvas{background:#111;border-radius:0 0 6px 6px;display:block;box-shadow:inset 0 0 10px #0008}
+  ul{text-align:left;margin-left:20px}
+</style></head>
+<body><div id="intro">
+    <h2>Змейка с поездами и пассажирами</h2>
+    <p>Собирайте вагоны (квадраты) и пассажиров (круги). Пассажир должен занять свободный вагон.</p>
+    <div>
+      <button id="startBtn">Начать игру</button>
+      <button id="motionBtn">Включить датчики</button>
+    </div>
+  </div>
+
+  <div id="gameContainer">
+    <div id="scoreboard">Очки: 0 | Рекорд: 0</div>
+    <canvas id="game" width="400" height="400"></canvas>
+  </div>
+
+<script>
+/* Универсальная обработка permission для разных iOS/браузеров */
+const startBtn = document.getElementById('startBtn');
+const motionBtn = document.getElementById('motionBtn');
+const intro = document.getElementById('intro');
+const gameContainer = document.getElementById('gameContainer');
+
+function motionPermissionNeeded(){
+  return (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') ||
+         (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function');
+}
+
+/* Запрос разрешения — не ждём его завершения в обработчике Start (iOS26 workaround).
+   Возвращает промис, но вызов может быть инициирован без await чтобы не блокировать UI. */
+function requestMotionPermissionNonBlocking(){
+  try {
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+      // вызов внутри пользовательского обработчика (тут — Start click)
+      const p = DeviceOrientationEvent.requestPermission();
+      // добавим обработчик результата, но не await — чтобы не блокировать поток
+      p.then(resp => {
+        if (resp === 'granted') window.addEventListener('deviceorientation', handleOrientation);
+      }).catch(()=>{});
+      return p;
+    } else if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+      const p = DeviceMotionEvent.requestPermission();
+      p.then(resp => {
+        if (resp === 'granted') {
+          window.addEventListener('deviceorientation', handleOrientation);
+          window.addEventListener('devicemotion', handleOrientation);
+        }
+      }).catch(()=>{});
+      return p;
+    } else {
+      // не требуется — подключаем сразу
+      window.addEventListener('deviceorientation', handleOrientation);
+      return Promise.resolve('no-request-needed');
+    }
+  } catch (err) {
+    return Promise.reject(err);
+  }
+}
+
+/* motionBtn запасной: позволит пользователю вручную запросить разрешение позже */
+motionBtn.addEventListener('click', () => {
+  motionBtn.disabled = true;
+  requestMotionPermissionNonBlocking()
+    .then(ok => {
+      // если успешно — скрываем кнопку
+      if (ok === 'granted' || ok === 'no-request-needed') motionBtn.style.display = 'none';
+    })
+    .catch(()=>{})
+    .finally(()=> motionBtn.disabled = false);
+});
+
+/* Start: инициируем запрос разрешения (не await), потом сразу запускаем игру.
+   Такой подход устраняет "залипание" click-события в iOS26. */
+startBtn.addEventListener('click', (e) => {
+  // небольшой hack: вручную ставим фокус/блокировку чтобы iOS точно посчитал это user gesture
+  try { startBtn.blur(); } catch(_) {}
+
+  if (motionPermissionNeeded()) {
+    // инициируем запрос разрешения в контексте клика, но НЕ await — сразу продолжаем
+    try { requestMotionPermissionNonBlocking(); } catch(_) {}
+    // покажем motionBtn на случай отказа/ошибки
+    motionBtn.style.display = 'inline-block';
+  } else {
+    motionBtn.style.display = 'none';
+  }
+
+  intro.style.display = 'none';
+  gameContainer.style.display = 'flex';
+  startGame();
+});
+
+/* ------------------ Игра ------------------ */
+function startGame(){
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const scoreboard = document.getElementById('scoreboard');
+  const cellSize = 20;
+  const cols = canvas.width / cellSize;
+  const rows = canvas.height / cellSize;
+
+  let snake = [{ x: Math.floor(cols/2), y: Math.floor(rows/2) }];
+  let passengers = new Set();
+  let freeWagons = new Set([0]);
+  let dir = { x:1, y:0 }, nextDir = { x:1, y:0 };
+  let score = 0;
+  let record = +localStorage.getItem('snake_record') || 0;
+  let paused = false, gameOver = false;
+  const speed = 150;
+  let wagon = null, passenger = null;
+  let lastTap = 0;
+
+  function coordsEqual(a,b){ return a && b && a.x===b.x && a.y===b.y; }
+
+  function randomPos(){
+    while(true){
+      const x = Math.floor(Math.random()*cols), y = Math.floor(Math.random()*rows);
+      const p = {x,y};
+      if (snake.some(s=>coordsEqual(s,p))) continue;
+      if (passenger && coordsEqual(passenger,p)) continue;
+      if (wagon && coordsEqual(wagon,p)) continue;
+      return p;
+    }
+  }
+  function placeWagon(){ wagon = randomPos(); }
+  function placePassenger(){ passenger = randomPos(); }
+  function updateScore(){ if (score>record){ record=score; localStorage.setItem('snake_record', record); } scoreboard.textContent = `Очки: ${score} | Рекорд: ${record}`; }
+
+  function draw(){
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle = '#000'; ctx.fillRect(0,0,canvas.width,canvas.height);
+    // head
+    const head = snake[0];
+    ctx.fillStyle = '#d00'; ctx.fillRect(head.x*cellSize, head.y*cellSize, cellSize, cellSize);
+    ctx.strokeStyle = '#800'; ctx.strokeRect(head.x*cellSize, head.y*cellSize, cellSize, cellSize);
+    // body
+    for (let i=1;i<snake.length;i++){
+      const s = snake[i];
+      ctx.fillStyle = '#808'; ctx.fillRect(s.x*cellSize, s.y*cellSize, cellSize, cellSize);
+      ctx.strokeStyle = '#404'; ctx.strokeRect(s.x*cellSize, s.y*cellSize, cellSize, cellSize);
+      if (passengers.has(i)){
+        ctx.fillStyle = '#f80'; ctx.beginPath();
+        ctx.arc(s.x*cellSize + cellSize/2, s.y*cellSize + cellSize/2, cellSize/2 - 3, 0, Math.PI*2); ctx.fill();
+        ctx.strokeStyle = '#b55'; ctx.stroke();
+      }
+    }
+    // wagon food
+    if (wagon && (!passenger || !coordsEqual(wagon, passenger))){
+      ctx.fillStyle = '#808'; ctx.fillRect(wagon.x*cellSize, wagon.y*cellSize, cellSize, cellSize);
+      ctx.strokeStyle = '#404'; ctx.strokeRect(wagon.x*cellSize, wagon.y*cellSize, cellSize, cellSize);
+    }
+    if (passenger && (!wagon || !coordsEqual(passenger, wagon))){
+      ctx.fillStyle = '#f80'; ctx.beginPath();
+      ctx.arc(passenger.x*cellSize + cellSize/2, passenger.y*cellSize + cellSize/2, cellSize/2 - 3, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = '#b55'; ctx.stroke();
+    }
+    if (paused){
+      ctx.fillStyle='rgba(0,0,0,0.6)'; ctx.fillRect(0,0,canvas.width,canvas.height);
+      ctx.fillStyle='white'; ctx.font='bold 32px monospace'; ctx.textAlign='center'; ctx.fillText('Пауза', canvas.width/2, canvas.height/2);
+    }
+    if (gameOver){
+      ctx.fillStyle='rgba(0,0,0,0.8)'; ctx.fillRect(0,0,canvas.width,canvas.height);
+      ctx.fillStyle='#f00'; ctx.font='bold 28px monospace'; ctx.textAlign='center'; ctx.fillText('Игра окончена', canvas.width/2, canvas.height/2 - 18);
+      ctx.fillStyle='white'; ctx.font='18px monospace'; ctx.fillText(`Очки: ${score}`, canvas.width/2, canvas.height/2 + 8);
+      ctx.fillText('Нажмите R или тапните для перезапуска', canvas.width/2, canvas.height/2 + 36);
+    }
+  }
+
+  function findFreeWagon(){
+    for (let i=1;i<snake.length;i++) if (!passengers.has(i)) return i;
+    return -1;
+  }
+
+  function recomputeFreeWagons(){ freeWagons.clear(); for (let i=1;i<snake.length;i++) if (!passengers.has(i)) freeWagons.add(i); }
+
+  function reset(){
+    snake = [{ x: Math.floor(cols/2), y: Math.floor(rows/2) }];
+    passengers.clear(); freeWagons.clear(); freeWagons.add(0);
+    dir = { x:1, y:0 }; nextDir = { ...dir }; score=0; gameOver=false; paused=false;
+    placeWagon(); placePassenger(); updateScore(); draw();
+  }
+
+  function gameTick(){
+    if (paused || gameOver) return;
+    // запрет 180
+    if (!((nextDir.x === -dir.x && nextDir.x !== 0) || (nextDir.y === -dir.y && nextDir.y !== 0))) dir = { ...nextDir };
+    const head = snake[0];
+    const newHead = { x:(head.x + dir.x + cols)%cols, y:(head.y + dir.y + rows)%rows };
+    if (snake.some(s=>coordsEqual(s,newHead))){ gameOver=true; draw(); return; }
+    snake.unshift(newHead);
+    const ateW = wagon && coordsEqual(newHead, wagon);
+    const ateP = passenger && coordsEqual(newHead, passenger);
+    if (ateW){ score++; placeWagon(); updateScore(); /* растём */ }
+    else if (ateP){
+      const free = findFreeWagon();
+      if (free < 1){ gameOver=true; draw(); return; }
+      passengers.add(free); score++; placePassenger(); updateScore(); snake.pop(); // не растём
+    } else snake.pop();
+    recomputeFreeWagons(); draw();
+  }
+
+  /* --- ориентация --- */
+  function handleOrientation(e){
+    if (paused || gameOver) return;
+    const g = e.gamma, b = e.beta;
+    if (g === null || b === null) return;
+    const th = 15;
+    if (Math.abs(g) > Math.abs(b)){
+      if (g > th && dir.x !== -1) nextDir = { x:1, y:0 };
+      else if (g < -th && dir.x !== 1) nextDir = { x:-1, y:0 };
+    } else {
+      if (b > th && dir.y !== -1) nextDir = { x:0, y:1 };
+      else if (b < -th && dir.y !== 1) nextDir = { x:0, y:-1 };
+    }
+  }
+
+  /* Попытка запросить permission при первом взаимодействии (если пользователь не нажал motionBtn) */
+  async function initMotionControlOnFirstInteraction(){
+    if (motionPermissionNeeded()){
+      try { requestMotionPermissionNonBlocking(); } catch(_) {}
+      motionBtn.style.display = 'inline-block';
+    } else {
+      window.addEventListener('deviceorientation', handleOrientation);
+    }
+    window.removeEventListener('pointerdown', initMotionControlOnFirstInteraction);
+    window.removeEventListener('touchstart', initMotionControlOnFirstInteraction);
+  }
+  window.addEventListener('pointerdown', initMotionControlOnFirstInteraction, { once:true });
+  window.addEventListener('touchstart', initMotionControlOnFirstInteraction, { once:true });
+
+  // клавиши
+  window.addEventListener('keydown', (e)=>{
+    if (gameOver && (e.key==='r' || e.key==='R')) { reset(); return; }
+    if (e.key===' '||e.key==='p'||e.key==='P'){ paused=!paused; draw(); return; }
+    if (paused||gameOver) return;
+    if ((e.key==='ArrowUp'||e.key==='w'||e.key==='W') && dir.y!==1) nextDir={x:0,y:-1};
+    else if ((e.key==='ArrowDown'||e.key==='s'||e.key==='S') && dir.y!==-1) nextDir={x:0,y:1};
+    else if ((e.key==='ArrowLeft'||e.key==='a'||e.key==='A') && dir.x!==1) nextDir={x:-1,y:0};
+    else if ((e.key==='ArrowRight'||e.key==='d'||e.key==='D') && dir.x!==-1) nextDir={x:1,y:0};
+  });
+
+  // тач
+  let ts = null;
+  canvas.addEventListener('touchstart', (ev)=>{ const t=ev.touches[0]; ts={x:t.clientX,y:t.clientY,time:Date.now()}; initMotionControlOnFirstInteraction(); }, {passive:true});
+  canvas.addEventListener('touchend', (ev)=>{ if(!ts) return; const t=ev.changedTouches[0]; const dx=t.clientX-ts.x, dy=t.clientY-ts.y, dt=Date.now()-ts.time, dist=Math.hypot(dx,dy);
+    if (dist<10 && dt<300){ if (gameOver) reset(); else { paused=!paused; draw(); } }
+    else {
+      if (Math.abs(dx)>Math.abs(dy)){ if (dx>0 && dir.x!==-1) nextDir={x:1,y:0}; else if (dx<0 && dir.x!==1) nextDir={x:-1,y:0}; }
+      else { if (dy>0 && dir.y!==-1) nextDir={x:0,y:1}; else if (dy<0 && dir.y!==1) nextDir={x:0,y:-1}; }
+    }
+    ts=null;
+  }, {passive:true});
+
+  // мышь
+  canvas.addEventListener('mousedown', ()=>{ const now=Date.now(); if (gameOver) { reset(); return; } if (now - lastTap < 300){ paused=!paused; draw(); } lastTap=now; initMotionControlOnFirstInteraction(); });
+
+  // init
+  placeWagon(); placePassenger(); updateScore(); draw();
+  const timer = setInterval(gameTick, speed);
+  window.addEventListener('beforeunload', ()=> clearInterval(timer));
+} // end startGame
+
+// показать motionBtn если нужно
+if (motionPermissionNeeded()) motionBtn.style.display = 'inline-block';
+</script></body>
+</html>

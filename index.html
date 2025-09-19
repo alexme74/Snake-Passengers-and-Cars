@@ -1,0 +1,306 @@
+<html>
+<head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Змейка с поездами и пассажирами</title>
+<style>
+  body {
+    margin: 0; 
+    background: #222;
+    display: flex; 
+    justify-content: center; 
+    align-items: center; 
+    height: 100vh;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  canvas {
+    background: #111;
+    display: block;
+  }
+  #scoreboard {
+    position: fixed;
+    top: 0;
+    width: 100%;
+    color: white;
+    font-family: monospace;
+    text-align: center;
+    padding: 5px 0;
+    background: #000a;
+    user-select: none;
+  }
+</style></head>
+<body><div id="scoreboard">Очки: 0 | Рекорд: 0</div>
+<canvas id="game" width="400" height="400"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const scoreboard = document.getElementById('scoreboard');
+
+  const cellSize = 20;
+  const cols = canvas.width / cellSize;
+  const rows = canvas.height / cellSize;
+
+  let snake = [{x: Math.floor(cols/2), y: Math.floor(rows/2)}];
+  let passengers = new Set(); // индексы вагонов с пассажирами (начиная с 1)
+  let freeWagons = new Set([0]); // индексы вагонов без пассажиров (голова 0 - всегда свободна)
+
+  let wagon = null;
+  let passenger = null;
+
+  let dir = {x: 1, y: 0};
+  let nextDir = {...dir};
+
+  let score = 0;
+  let record = +localStorage.getItem('snake_record') || 0;
+
+  let paused = false;
+  let gameOver = false;
+
+  const speed = 150;
+
+  let lastTap = 0;
+
+  function coordsEqual(a,b) {
+    return a.x === b.x && a.y === b.y;
+  }
+
+  // При добавлении вагона добавляем ровно один сегмент в хвост,
+  // при движении не убираем хвост (змейка растет)
+  function addWagon() {
+    const tail = snake[snake.length - 1];
+    freeWagons.add(snake.length - 1);
+  }
+
+  function findFreeWagon() {
+    for (let i = 1; i < snake.length; i++) {
+      if (freeWagons.has(i)) return i;
+    }
+    return -1;
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Голова - красная
+    const head = snake[0];
+    ctx.fillStyle = '#d00';
+    ctx.fillRect(head.x * cellSize, head.y * cellSize, cellSize, cellSize);
+    ctx.strokeStyle = '#800000';
+    ctx.strokeRect(head.x * cellSize, head.y * cellSize, cellSize, cellSize);
+
+    // Тело змейки - вагоны
+    for(let i = 1; i < snake.length; i++) {
+      const s = snake[i];
+ 
+      ctx.fillStyle = '#08f';
+      ctx.fillRect(s.x * cellSize, s.y * cellSize, cellSize, cellSize);
+      ctx.strokeStyle = '#003355';
+      ctx.strokeRect(s.x * cellSize, s.y * cellSize, cellSize, cellSize);
+      
+      if (!freeWagons.has(i)) {
+        ctx.fillStyle = '#f80';
+        ctx.beginPath();
+        ctx.arc(s.x * cellSize + 10, s.y * cellSize + 10, cellSize/2 - 3, 0, Math.PI*2);
+        ctx.fill();
+        ctx.strokeStyle = '#b55000';
+        ctx.stroke();
+      }
+    }
+
+    // Вагон еды (если не совпадает с пассажиром)
+    if(wagon && (!coordsEqual(wagon, passenger))) {
+      ctx.fillStyle = '#808080';
+      ctx.fillRect(wagon.x * cellSize, wagon.y * cellSize, cellSize, cellSize);
+      ctx.strokeStyle = '#004488';
+      ctx.strokeRect(wagon.x * cellSize, wagon.y * cellSize, cellSize, cellSize);
+    }
+
+    // Пассажир
+    if(passenger) {
+      ctx.fillStyle = '#f80';
+      ctx.beginPath();
+      ctx.arc(passenger.x * cellSize + cellSize/2, passenger.y * cellSize + cellSize/2, cellSize/2 - 3, 0, Math.PI*2);
+      ctx.fill();
+      ctx.strokeStyle = '#b55000';
+      ctx.stroke();
+    }
+
+    if(paused) {
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = 'white';
+      ctx.font = 'bold 32px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('Пауза', canvas.width/2, canvas.height/2);
+    }
+
+    if(gameOver) {
+      ctx.fillStyle = 'rgba(0,0,0,0.8)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#f00';
+      ctx.font = 'bold 32px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('Игра окончена', canvas.width/2, canvas.height/2 - 20);
+      ctx.fillStyle = 'white';
+      ctx.font = '20px monospace';
+      ctx.fillText(`Очки: ${score}`, canvas.width/2, canvas.height/2 + 20);
+      ctx.fillText(`Нажмите R для перезапуска`, canvas.width/2, canvas.height/2 + 50);
+    }
+  }
+
+  function randomPos() {
+    while(true) {
+      const x = Math.floor(Math.random() * cols);
+      const y = Math.floor(Math.random() * rows);
+      const pos = {x,y};
+      if (snake.some(s => coordsEqual(s,pos))) continue;
+      if (passenger && coordsEqual(passenger,pos)) continue;
+      if (wagon && coordsEqual(wagon,pos)) continue;
+      return pos;
+    }
+  }
+
+  function reset() {
+    snake = [{x: Math.floor(cols/2), y: Math.floor(rows/2)}];
+    passengers.clear();
+    freeWagons.clear();
+    freeWagons.add(0);
+    dir = {x:1, y:0};
+    nextDir = {...dir};
+    score = 0;
+    gameOver = false;
+    paused = false;
+    placeWagon();
+    placePassenger();
+    updateScore();
+  }
+
+  function placeWagon() {
+    wagon = randomPos();
+  }
+  function placePassenger() {
+    passenger = randomPos();
+  }
+
+  function updateScore() {
+    if(score > record) {
+      record = score;
+      localStorage.setItem('snake_record', record);
+    }
+    scoreboard.textContent = `Очки: ${score} | Рекорд: ${record}`;
+  }
+
+  function gameTick() {
+    if(paused || gameOver) return;
+
+    dir = {...nextDir};
+
+    const head = snake[0];
+    const newX = (head.x + dir.x + cols) % cols;
+    const newY = (head.y + dir.y + rows) % rows;
+    const newHead = {x: newX, y: newY};
+
+    // Проверка столкновения со змейкой
+    for(const segment of snake) {
+      if(coordsEqual(segment, newHead)) {
+        gameOver = true;
+        draw();
+        return;
+      }
+    }
+
+    snake.unshift(newHead);
+
+    const ateWagon = wagon && coordsEqual(newHead, wagon);
+    const atePassenger = passenger && coordsEqual(newHead, passenger);
+
+    if(ateWagon) {
+      score++;
+      // При съедании вагона растём: НЕ убираем хвост (растём ровно на 1 сегмент)
+      addWagon();
+      placeWagon();
+      updateScore();
+      // Не удаляем хвост, змейка увеличилась на 1 сегмент
+    }
+    else if(atePassenger) {
+      const free = findFreeWagon();
+      if(free < 1) {
+        gameOver = true;
+        draw();
+        return;
+      }
+      freeWagons.delete(free);
+      passengers.add(free);
+      score++;
+      placePassenger();
+      updateScore();
+      // При съедании пассажира змейка НЕ растёт, хвост убирается:
+      snake.pop();
+    }
+    else {
+      // Просто движемся — хвост убирается (длина не меняется)
+      snake.pop();
+    }
+
+    // Обновляем множество свободных вагонов и пассажиров
+    freeWagons.clear();
+    freeWagons.add(0);
+    for(let i = 1; i < snake.length; i++) {
+      if(!passengers.has(i)) {
+        freeWagons.add(i);
+      }
+    }
+    // Голова не может иметь пассажиров:
+    passengers.delete(0);
+
+    draw();
+  }
+
+  window.addEventListener('keydown', e => {
+    if(gameOver && (e.key === 'r' || e.key === 'R')) {
+      reset();
+      return;
+    }
+    if(e.key === 'ArrowLeft' && dir.x !== 1) nextDir = {x:-1, y:0};
+    else if(e.key === 'ArrowUp' && dir.y !== 1) nextDir = {x:0, y:-1};
+    else if(e.key === 'ArrowRight' && dir.x !== -1) nextDir = {x:1, y:0};
+    else if(e.key === 'ArrowDown' && dir.y !== -1) nextDir = {x:0, y:1};
+    else if(e.key === ' ') {
+      paused = !paused;
+      draw();
+    }
+  });
+
+  window.addEventListener('deviceorientation', e => {
+    if(paused || gameOver) return;
+    const gamma = e.gamma;
+    const beta = e.beta;
+    if(gamma === null || beta === null) return;
+    if(Math.abs(gamma) > Math.abs(beta)) {
+      if(gamma > 15 && dir.x !== -1) nextDir = {x:1, y:0};
+      else if(gamma < -15 && dir.x !== 1) nextDir = {x:-1, y:0};
+    } else {
+      if(beta > 15 && dir.y !== -1) nextDir = {x:0, y:1};
+      else if(beta < -15 && dir.y !== 1) nextDir = {x:0, y:-1};
+    }
+  });
+
+  canvas.addEventListener('touchend', e => {
+    const now = Date.now();
+    if(now - lastTap < 300) {
+      paused = !paused;
+      draw();
+      lastTap = 0;
+    } else {
+      lastTap = now;
+    }
+  });
+
+  reset();
+  setInterval(gameTick, speed);
+})();
+</script></body>
+</html>
